@@ -173,23 +173,67 @@ class CompleteMapOverlayGenerator:
     # Coordinate transforms
     # ------------------------------
     def _df_with_world_coords(self, df):
-        """Return a copy of df with plotting coords (wx, wy) derived from OpenDota x/y.
-        OpenDota uses a 128x128 grid (x,y in [0,127]) with origin at top-left.
-        We map directly to image pixel coordinates (origin='upper').
+        """Return a copy of df with plotting coords (wx, wy) derived from x/y.
+        Handles multiple possible coordinate systems from OpenDota data:
+        - 128x128 grid: x,y in [0,127], origin top-left (common for obs_log/sen_log)
+        - 256x256 grid: x,y in [0,255], origin top-left (seen in some exports)
+        - World coords: x,y in approximately [-8000, 8000]
+        All mapped to image pixel coordinates with origin='upper'.
         """
         if df is None or len(df) == 0:
             return df
-        # OpenDota grid is 0..127
-        denom = 127.0
         dfx = df.copy()
         dfx = dfx.dropna(subset=['x', 'y'])
         if len(dfx) == 0:
             return dfx
-        xg = dfx['x'].astype(float).clip(lower=0.0, upper=denom)
-        yg = dfx['y'].astype(float).clip(lower=0.0, upper=denom)
-        # Optional: align to cell centers using +0.5 offset. Keep 0.0 for now to match edges.
-        dfx['wx'] = (xg / denom) * float(self.map_width)
-        dfx['wy'] = (yg / denom) * float(self.map_height)
+        # Convert to float
+        xraw = dfx['x'].astype(float)
+        yraw = dfx['y'].astype(float)
+        xmin, xmax = float(xraw.min()), float(xraw.max())
+        ymin, ymax = float(yraw.min()), float(yraw.max())
+
+        # Choose mapping strategy
+        use_world = False
+        denom = None
+        # Heuristic: if values clearly within 0..127 with small slack
+        if xmin >= -1 and xmax <= 128.5 and ymin >= -1 and ymax <= 128.5:
+            # Likely OpenDota 128-grid
+            denom = 127.0
+            xg = xraw.clip(lower=0.0, upper=denom)
+            yg = yraw.clip(lower=0.0, upper=denom)
+            dfx['wx'] = (xg / denom) * float(self.map_width)
+            dfx['wy'] = (yg / denom) * float(self.map_height)
+            return dfx
+        # If within 0..255 (e.g., 256-grid)
+        if xmin >= -1 and xmax <= 256.5 and ymin >= -1 and ymax <= 256.5:
+            # 256-grid variant
+            denom = 255.0
+            xg = xraw.clip(lower=0.0, upper=denom)
+            yg = yraw.clip(lower=0.0, upper=denom)
+            dfx['wx'] = (xg / denom) * float(self.map_width)
+            dfx['wy'] = (yg / denom) * float(self.map_height)
+            return dfx
+        # If appears to be world coordinates
+        if xmin >= -20000 and xmax <= 20000 and ymin >= -20000 and ymax <= 20000:
+            use_world = True
+        if use_world:
+            left = float(self.map_bounds.get('left', -8000.0))
+            right = float(self.map_bounds.get('right', 8000.0))
+            bottom = float(self.map_bounds.get('bottom', -8000.0))
+            top = float(self.map_bounds.get('top', 8000.0))
+            # Clamp to world bounds to avoid outliers
+            xw = xraw.clip(lower=left, upper=right)
+            yw = yraw.clip(lower=bottom, upper=top)
+            # Map world x directly to pixel x
+            dfx['wx'] = ((xw - left) / (right - left)) * float(self.map_width)
+            # For origin='upper': top world (max y) should map to y=0 pixels
+            dfx['wy'] = ((top - yw) / (top - bottom)) * float(self.map_height)
+            return dfx
+        # Fallback: scale by max range to avoid collapsing to corners
+        rng = max(1.0, float(max(xmax - xmin, ymax - ymin)))
+        dfx['wx'] = ((xraw - xmin) / rng) * float(self.map_width)
+        # Invert y so larger y goes downward if raw looked increasing upward
+        dfx['wy'] = ((ymax - yraw) / rng) * float(self.map_height)
         return dfx
     
     def _create_synthetic_map(self):

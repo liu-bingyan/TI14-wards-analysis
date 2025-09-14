@@ -23,7 +23,9 @@ build/
 dist/
 
 # Project outputs
-output*/
+output1*/
+output2/historical/
+output_test*/
 __archive__/
 
 # Logs
