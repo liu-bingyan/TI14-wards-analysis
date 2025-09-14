@@ -1,0 +1,6 @@
+match_id,team_id,ward_type,time,x,y,time_window,game_stage,momentum,hero_name,wx,wy,x_original,y_original,coord_type,map_width,map_height,x_processed,y_processed,grid_denom,transform_enabled,transform_scale,transform_shift_x,transform_shift_y,transform_invert_y
+8460164236,9247354,sentry,3891,93.8,120.1,60-65min,Very Late Game,Positive,Enchantress,756.3086614173228,968.3653543307087,93.8,120.1,auto_grid_127,1024,1024,93.8,120.1,127.0,True,1.0,0.0,0.0,False
+8460164236,9247354,observer,3740,118.2,94.1,60-65min,Very Late Game,Neutral,Snapfire,953.0456692913386,758.727559055118,118.2,94.1,auto_grid_127,1024,1024,118.2,94.1,127.0,True,1.0,0.0,0.0,False
+8460164236,9247354,observer,3836,94.2,119.7,60-65min,Very Late Game,Positive,Snapfire,759.5338582677166,965.140157480315,94.2,119.7,auto_grid_127,1024,1024,94.2,119.7,127.0,True,1.0,0.0,0.0,False
+8460164236,9247354,observer,3854,84.5,115.5,60-65min,Very Late Game,Positive,Snapfire,681.3228346456693,931.2755905511812,84.5,115.5,auto_grid_127,1024,1024,84.5,115.5,127.0,True,1.0,0.0,0.0,False
+8460164236,9247354,sentry,3790,117.7,94.1,60-65min,Very Late Game,Positive,Snapfire,949.0141732283465,758.727559055118,117.7,94.1,auto_grid_127,1024,1024,117.7,94.1,127.0,True,1.0,0.0,0.0,False

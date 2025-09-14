@@ -25,7 +25,9 @@ dist/
 # Project outputs
 output1*/
 output2/historical/
+output/
 output_test*/
+output_regen*/
 __archive__/
 
 # Logs

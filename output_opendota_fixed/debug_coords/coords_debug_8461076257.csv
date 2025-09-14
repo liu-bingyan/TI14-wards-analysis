@@ -1,0 +1,4 @@
+match_id,team_id,ward_type,time,x,y,time_window,game_stage,momentum,hero_name,wx,wy,x_original,y_original,coord_type,map_width,map_height,x_processed,y_processed,grid_denom,transform_enabled,transform_scale,transform_shift_x,transform_shift_y,transform_invert_y
+8461076257,9572001,observer,2432,96.1,96.4,40-45min,Very Late Game,Neutral,Void Spirit,774.8535433070866,777.272440944882,96.1,96.4,auto_grid_127,1024,1024,96.1,96.4,127.0,True,1.0,0.0,0.0,False
+8461076257,9572001,sentry,2432,96.1,96.4,40-45min,Very Late Game,Neutral,Void Spirit,774.8535433070866,777.272440944882,96.1,96.4,auto_grid_127,1024,1024,96.1,96.4,127.0,True,1.0,0.0,0.0,False
+8461076257,9572001,sentry,2454,97.5,75.3,40-45min,Very Late Game,Neutral,Elder Titan,786.1417322834645,607.1433070866142,97.5,75.3,auto_grid_127,1024,1024,97.5,75.3,127.0,True,1.0,0.0,0.0,False

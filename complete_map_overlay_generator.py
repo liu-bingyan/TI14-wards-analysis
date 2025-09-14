@@ -33,7 +33,7 @@ class CompleteMapOverlayGenerator:
     def __init__(self, api_key=None, map_image_path: str = None, show_vision: bool = False,
                  observer_vision_radius: int = 1400, sentry_truesight_radius: int = 1000,
                  advantage_threshold: int = 2000, show_labels: bool = False,
-                 output_dir: str = "output"):
+                 output_dir: str = "output", transform_config_path: str = "assets/minimap_transform.json"):
         self.base_url = "https://api.opendota.com/api"
         self.api_key = api_key
         self.session = requests.Session()
@@ -64,6 +64,43 @@ class CompleteMapOverlayGenerator:
         except Exception:
             self.map_height, self.map_width = 1024, 1024
         self._load_hero_data()
+        # Optional grid->pixel affine transform (for distorted or non-linear minimaps)
+        self.grid_transform = {
+            'enabled': False,
+            'scale': 1.0,           # uniform scale about grid center
+            'rotate_deg': 0.0,      # rotation about grid center (degrees, CCW)
+            'shift_x': 0.0,         # shift in grid units (same units as x,y)
+            'shift_y': 0.0,
+            'denom_hint': None,     # 127 or 255 if you want to lock grid size
+            'invert_y': True        # OpenDota often uses origin at bottom-left for grid Y
+        }
+        self._load_transform_config(transform_config_path)
+
+    def _load_transform_config(self, path: str):
+        try:
+            p = Path(path)
+            if not p.exists():
+                return
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                cfg = self.grid_transform.copy()
+                cfg.update({k: data.get(k, cfg[k]) for k in cfg.keys()})
+                # basic validation
+                cfg['enabled'] = bool(cfg.get('enabled', False))
+                cfg['scale'] = float(cfg.get('scale', 1.0))
+                cfg['rotate_deg'] = float(cfg.get('rotate_deg', 0.0))
+                cfg['shift_x'] = float(cfg.get('shift_x', 0.0))
+                cfg['shift_y'] = float(cfg.get('shift_y', 0.0))
+                denom_hint = cfg.get('denom_hint')
+                if denom_hint is not None:
+                    try:
+                        cfg['denom_hint'] = int(denom_hint)
+                    except Exception:
+                        cfg['denom_hint'] = None
+                self.grid_transform = cfg
+                print(f"📐 Loaded minimap transform: {self.grid_transform}")
+        except Exception as e:
+            print(f"⚠️ Failed to load transform config: {e}")
     
     def _load_dota_map(self, custom_path: str = None):
         """Load the Dota 2 map image"""
@@ -172,7 +209,125 @@ class CompleteMapOverlayGenerator:
     # ------------------------------
     # Coordinate transforms
     # ------------------------------
-    def _df_with_world_coords(self, df):
+    def _apply_grid_affine(self, xg, yg, denom: float):
+        """Apply optional affine in grid space.
+        xg, yg are pd.Series in grid units [0..denom]. Returns transformed (x2, y2).
+        FIXED: Scale around center, handle Y-inversion, avoid edge clipping.
+        """
+        tf = self.grid_transform or {}
+        if not tf.get('enabled'):
+            return xg, yg
+        
+        # Get transform parameters
+        s = float(tf.get('scale', 1.0) or 1.0)
+        sx = float(tf.get('shift_x', 0.0) or 0.0)
+        sy = float(tf.get('shift_y', 0.0) or 0.0)
+        invert_y = tf.get('invert_y', False)
+        
+        # Handle Y-inversion FIRST if requested
+        rx = xg.copy()
+        ry = yg.copy()
+        if invert_y:
+            ry = denom - ry
+        
+        # Scale around CENTER of grid, not origin
+        center = denom / 2.0
+        rx = (rx - center) * s + center
+        ry = (ry - center) * s + center
+        
+        # Apply rotation around center if specified
+        th = float(tf.get('rotate_deg', 0.0) or 0.0) * np.pi / 180.0
+        if abs(th) > 1e-8:
+            cos_t = np.cos(th); sin_t = np.sin(th)
+            # Translate to origin for rotation
+            rx_centered = rx - center
+            ry_centered = ry - center
+            # Rotate
+            rx2 = cos_t * rx_centered - sin_t * ry_centered
+            ry2 = sin_t * rx_centered + cos_t * ry_centered
+            # Translate back
+            rx = rx2 + center
+            ry = ry2 + center
+        
+        # Apply shift
+        rx = rx + sx
+        ry = ry + sy
+        
+        # Clamp to valid grid range - no margin to avoid drawing outside map
+        rx = rx.clip(lower=0.0, upper=denom)
+        ry = ry.clip(lower=0.0, upper=denom)
+        
+        return rx, ry
+
+    def _apply_grid_affine_normalized(self, x_norm, y_norm):
+        """Apply affine transform to normalized coordinates [0,1]."""
+        tf = self.grid_transform or {}
+        if not tf.get('enabled'):
+            return x_norm, y_norm
+        
+        # Get transform parameters
+        s = float(tf.get('scale', 1.0) or 1.0)
+        sx = float(tf.get('shift_x', 0.0) or 0.0) / 128.0  # Normalize shift to [0,1] scale
+        sy = float(tf.get('shift_y', 0.0) or 0.0) / 128.0
+        invert_y = tf.get('invert_y', False)
+        
+        # Handle Y-inversion FIRST if requested
+        rx = x_norm.copy()
+        ry = y_norm.copy()
+        if invert_y:
+            ry = 1.0 - ry
+        
+        # Scale around center of normalized space (0.5, 0.5)
+        center = 0.5
+        rx = (rx - center) * s + center
+        ry = (ry - center) * s + center
+        
+        # Apply shift
+        rx = rx + sx
+        ry = ry + sy
+        
+        # Clamp to valid coordinate range - no margin to avoid drawing outside map
+        rx = rx.clip(lower=0.0, upper=1.0)
+        ry = ry.clip(lower=0.0, upper=1.0)
+        
+        return rx, ry
+
+    def _is_valid_game_position(self, wx, wy):
+        """Check if pixel coordinates are within the valid game area (not black corners).
+        Dota 2 map is roughly diamond-shaped, so filter out the corner regions.
+        """
+        # Convert to normalized coordinates [0,1]
+        x_norm = wx / float(self.map_width)
+        y_norm = wy / float(self.map_height)
+        
+        # Define the valid diamond/square game area boundaries
+        # The game area is roughly a rotated square, we can approximate with:
+        # - Exclude corners where both x and y are extreme
+        margin = 0.1  # 10% margin from edges
+        
+        # Check if point is in corner regions (areas that are typically black/void)
+        in_top_left = (x_norm < margin) and (y_norm < margin)
+        in_top_right = (x_norm > 1-margin) and (y_norm < margin)
+        in_bottom_left = (x_norm < margin) and (y_norm > 1-margin)
+        in_bottom_right = (x_norm > 1-margin) and (y_norm > 1-margin)
+        
+        # Also exclude extreme edges
+        too_close_to_edge = (x_norm < 0.05) or (x_norm > 0.95) or (y_norm < 0.05) or (y_norm > 0.95)
+        
+        return not (in_top_left or in_top_right or in_bottom_left or in_bottom_right or too_close_to_edge)
+
+    def _filter_valid_positions(self, df):
+        """Filter dataframe to only include positions within valid game area."""
+        if df is None or len(df) == 0:
+            return df
+        if 'wx' not in df.columns or 'wy' not in df.columns:
+            return df
+        
+        # Apply the valid position filter
+        valid_mask = df.apply(lambda row: self._is_valid_game_position(row['wx'], row['wy']), axis=1)
+        return df[valid_mask].copy()
+
+    def _df_with_world_coords(self, df, debug_match_id=None):
         """Return a copy of df with plotting coords (wx, wy) derived from x/y.
         Handles multiple possible coordinate systems from OpenDota data:
         - 128x128 grid: x,y in [0,127], origin top-left (common for obs_log/sen_log)
@@ -195,27 +350,63 @@ class CompleteMapOverlayGenerator:
         # Choose mapping strategy
         use_world = False
         denom = None
-        # Heuristic: if values clearly within 0..127 with small slack
+        coord_type = "unknown"
+        
+        # Auto-detect coordinate system based on actual data range
         if xmin >= -1 and xmax <= 128.5 and ymin >= -1 and ymax <= 128.5:
-            # Likely OpenDota 128-grid
+            # Classic 128-grid (0-127)
             denom = 127.0
-            xg = xraw.clip(lower=0.0, upper=denom)
-            yg = yraw.clip(lower=0.0, upper=denom)
-            dfx['wx'] = (xg / denom) * float(self.map_width)
-            dfx['wy'] = (yg / denom) * float(self.map_height)
-            return dfx
-        # If within 0..255 (e.g., 256-grid)
-        if xmin >= -1 and xmax <= 256.5 and ymin >= -1 and ymax <= 256.5:
-            # 256-grid variant
+            coord_type = "auto_grid_127"
+        elif xmin >= -1 and xmax <= 256.5 and ymin >= -1 and ymax <= 256.5:
+            # OpenDota 256-grid (0-255) but actual game area is (64-192)
             denom = 255.0
-            xg = xraw.clip(lower=0.0, upper=denom)
-            yg = yraw.clip(lower=0.0, upper=denom)
-            dfx['wx'] = (xg / denom) * float(self.map_width)
-            dfx['wy'] = (yg / denom) * float(self.map_height)
+            coord_type = "auto_grid_255_opendota"
+        else:
+            # Check user forced denom as fallback
+            forced = self.grid_transform.get('denom_hint')
+            if forced in (127, 255):
+                denom = float(forced)
+                coord_type = f"forced_grid_{int(denom)}"
+        if denom is not None:
+            # Handle different grid types
+            if coord_type == "auto_grid_255_opendota":
+                # OpenDota specific: game area is (64-192) within 0-255 grid
+                # Map (64,192) to (0,1) for proper minimap coverage
+                game_min, game_max = 64.0, 192.0
+                xg = xraw.clip(lower=game_min, upper=game_max)
+                yg = yraw.clip(lower=game_min, upper=game_max)
+                # Normalize to [0,1] based on actual game area
+                xg_norm = (xg - game_min) / (game_max - game_min)
+                yg_norm = (yg - game_min) / (game_max - game_min)
+                # Apply transform if enabled
+                if self.grid_transform.get('enabled'):
+                    xg_norm, yg_norm = self._apply_grid_affine_normalized(xg_norm, yg_norm)
+                # Convert to pixel coordinates
+                dfx['wx'] = xg_norm * float(self.map_width)
+                dfx['wy'] = yg_norm * float(self.map_height)
+                # For debug, save normalized coords
+                xg, yg = xg_norm * 128.0, yg_norm * 128.0  # Convert back to 128 scale for debug
+            else:
+                # Standard 127 or other grids
+                xg = xraw.clip(lower=0.0, upper=denom)
+                yg = yraw.clip(lower=0.0, upper=denom)
+                # Optional affine to adjust scale/rotation/shift for distorted minimaps
+                xg, yg = self._apply_grid_affine(xg, yg, denom)
+                dfx['wx'] = (xg / denom) * float(self.map_width)
+                dfx['wy'] = (yg / denom) * float(self.map_height)
+            
+            # Clip to pixel bounds before returning
+            dfx['wx'] = np.clip(dfx['wx'].astype(float), 0.0, float(self.map_width) - 1e-6)
+            dfx['wy'] = np.clip(dfx['wy'].astype(float), 0.0, float(self.map_height) - 1e-6)
+            # Save debug data if match_id provided
+            if debug_match_id and hasattr(self, 'output_dir'):
+                self._save_debug_coords(dfx, debug_match_id, coord_type, xraw, yraw, xg, yg, denom)
+            
             return dfx
         # If appears to be world coordinates
         if xmin >= -20000 and xmax <= 20000 and ymin >= -20000 and ymax <= 20000:
             use_world = True
+            coord_type = "world_coords"
         if use_world:
             left = float(self.map_bounds.get('left', -8000.0))
             right = float(self.map_bounds.get('right', 8000.0))
@@ -228,13 +419,60 @@ class CompleteMapOverlayGenerator:
             dfx['wx'] = ((xw - left) / (right - left)) * float(self.map_width)
             # For origin='upper': top world (max y) should map to y=0 pixels
             dfx['wy'] = ((top - yw) / (top - bottom)) * float(self.map_height)
+            
+            # Clip to pixel bounds before returning
+            dfx['wx'] = np.clip(dfx['wx'].astype(float), 0.0, float(self.map_width) - 1e-6)
+            dfx['wy'] = np.clip(dfx['wy'].astype(float), 0.0, float(self.map_height) - 1e-6)
+            # Save debug data if match_id provided
+            if debug_match_id and hasattr(self, 'output_dir'):
+                self._save_debug_coords(dfx, debug_match_id, coord_type, xraw, yraw, xw, yw)
+            
             return dfx
         # Fallback: scale by max range to avoid collapsing to corners
+        coord_type = "fallback_range"
         rng = max(1.0, float(max(xmax - xmin, ymax - ymin)))
         dfx['wx'] = ((xraw - xmin) / rng) * float(self.map_width)
         # Invert y so larger y goes downward if raw looked increasing upward
         dfx['wy'] = ((ymax - yraw) / rng) * float(self.map_height)
+        
+        # Clip to pixel bounds before returning
+        dfx['wx'] = np.clip(dfx['wx'].astype(float), 0.0, float(self.map_width) - 1e-6)
+        dfx['wy'] = np.clip(dfx['wy'].astype(float), 0.0, float(self.map_height) - 1e-6)
+        # Save debug data if match_id provided
+        if debug_match_id and hasattr(self, 'output_dir'):
+            self._save_debug_coords(dfx, debug_match_id, coord_type, xraw, yraw, xraw, yraw)
+            
         return dfx
+
+    def _save_debug_coords(self, df, match_id, coord_type, x_orig, y_orig, x_processed=None, y_processed=None, denom=None):
+        """Save coordinate transformation debug data to CSV."""
+        debug_dir = Path(self.output_dir) / "debug_coords"
+        debug_dir.mkdir(exist_ok=True, parents=True)
+        
+        debug_data = df.copy()
+        debug_data['x_original'] = x_orig
+        debug_data['y_original'] = y_orig
+        debug_data['coord_type'] = coord_type
+        debug_data['map_width'] = self.map_width
+        debug_data['map_height'] = self.map_height
+        
+        if x_processed is not None:
+            debug_data['x_processed'] = x_processed
+            debug_data['y_processed'] = y_processed
+        if denom is not None:
+            debug_data['grid_denom'] = denom
+        
+        # Add transform config
+        if hasattr(self, 'grid_transform'):
+            debug_data['transform_enabled'] = self.grid_transform.get('enabled', False)
+            debug_data['transform_scale'] = self.grid_transform.get('scale', 1.0)
+            debug_data['transform_shift_x'] = self.grid_transform.get('shift_x', 0.0)
+            debug_data['transform_shift_y'] = self.grid_transform.get('shift_y', 0.0)
+            debug_data['transform_invert_y'] = self.grid_transform.get('invert_y', True)
+        
+        csv_path = debug_dir / f"coords_debug_{match_id}.csv"
+        debug_data.to_csv(csv_path, index=False)
+        print(f"📊 Debug coords saved: {csv_path}")
     
     def _create_synthetic_map(self):
         """Create a synthetic Dota 2-style map"""
@@ -431,6 +669,12 @@ class CompleteMapOverlayGenerator:
             df_window = self._df_with_world_coords(df_window)
             if df_window is None or len(df_window) == 0:
                 return
+        
+        # Filter to only valid game positions (not in black corner areas)
+        df_window = self._filter_valid_positions(df_window)
+        if df_window is None or len(df_window) == 0:
+            return
+            
         obs_wards = df_window[df_window['ward_type'] == 'observer']
         sen_wards = df_window[df_window['ward_type'] == 'sentry']
 
@@ -438,11 +682,11 @@ class CompleteMapOverlayGenerator:
         if len(obs_wards) > 0:
             ax.scatter(obs_wards['wx'], obs_wards['wy'],
                        c='yellow', s=80, alpha=0.9, marker='o',
-                       edgecolors='goldenrod', linewidths=1.5, label='Observer')
+                       edgecolors='goldenrod', linewidths=1.5, label='Observer', clip_on=True)
         if len(sen_wards) > 0:
             ax.scatter(sen_wards['wx'], sen_wards['wy'],
-                       c='#87CEFA', s=70, alpha=0.9, marker='o',
-                       edgecolors='royalblue', linewidths=1.5, label='Sentry')
+                       c='#87CEFA', s=50, alpha=0.9, marker='o',
+                       edgecolors='royalblue', linewidths=1.5, label='Sentry', clip_on=True)
 
         # Vision circles (approximate)
         if self.show_vision:
@@ -478,7 +722,10 @@ class CompleteMapOverlayGenerator:
             try:
                 # Show grid coords for readability and keep annotation at world coords
                 gx = r.get('x'); gy = r.get('y')
-                ax.text(x + 120, y + 120, f"g:({int(gx)}, {int(gy)})",
+                # Clamp annotation within axes bounds to avoid drawing outside
+                px = float(min(max(x + 120, 5.0), float(self.map_width) - 5.0))
+                py = float(min(max(y + 120, 5.0), float(self.map_height) - 5.0))
+                ax.text(px, py, f"g:({int(gx)}, {int(gy)})",
                         color=text_color, fontsize=fontsize,
                         bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.5))
             except Exception:
@@ -543,7 +790,7 @@ class CompleteMapOverlayGenerator:
                              bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7, edgecolor='white'))
             
             df_window = df_pos[df_pos['time_window'] == time_window]
-            df_window = self._df_with_world_coords(df_window)
+            df_window = self._df_with_world_coords(df_window, debug_match_id=match_id)
             if len(df_window) > 0:
                 self._draw_wards_with_optional_vision(axes[i], df_window)
                 if self.show_labels:
@@ -602,6 +849,8 @@ class CompleteMapOverlayGenerator:
                               bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
             axes[i].set_xlim(0, self.map_width)
             axes[i].set_ylim(0, self.map_height)
+            axes[i].set_aspect('equal', adjustable='box')
+            axes[i].margins(0)
             axes[i].grid(True, alpha=0.3, color='white')
             axes[i].set_facecolor('black')
         
@@ -685,6 +934,8 @@ class CompleteMapOverlayGenerator:
                         facecolor='black', alpha=0.7, edgecolor='white'))
                 ax.set_xlim(0, self.map_width)
                 ax.set_ylim(0, self.map_height)
+                ax.set_aspect('equal', adjustable='box')
+                ax.margins(0)
                 ax.grid(True, alpha=0.3, color='white')
                 ax.set_facecolor('black')
 
@@ -696,9 +947,9 @@ class CompleteMapOverlayGenerator:
                     obs = dsub[dsub['ward_type']=='observer']
                     sen = dsub[dsub['ward_type']=='sentry']
                     if len(obs)>0:
-                        axes[r,0].scatter(obs['wx'], obs['wy'], c='yellow', s=80, alpha=0.9, marker='o', edgecolors='goldenrod', linewidths=1.5)
+                        axes[r,0].scatter(obs['wx'], obs['wy'], c='yellow', s=80, alpha=0.9, marker='o', edgecolors='goldenrod', linewidths=1.5, clip_on=True)
                     if len(sen)>0:
-                        axes[r,0].scatter(sen['wx'], sen['wy'], c='#87CEFA', s=70, alpha=0.9, marker='o', edgecolors='royalblue', linewidths=1.5)
+                        axes[r,0].scatter(sen['wx'], sen['wy'], c='#87CEFA', s=50, alpha=0.9, marker='o', edgecolors='royalblue', linewidths=1.5, clip_on=True)
             # Night Dire (col 1)
             if not dfd.empty and night:
                 dsub = dfd[dfd['time_window'] == win]
@@ -706,9 +957,9 @@ class CompleteMapOverlayGenerator:
                     obs = dsub[dsub['ward_type']=='observer']
                     sen = dsub[dsub['ward_type']=='sentry']
                     if len(obs)>0:
-                        axes[r,1].scatter(obs['wx'], obs['wy'], c='yellow', s=80, alpha=0.9, marker='o', edgecolors='goldenrod', linewidths=1.5)
+                        axes[r,1].scatter(obs['wx'], obs['wy'], c='yellow', s=80, alpha=0.9, marker='o', edgecolors='goldenrod', linewidths=1.5, clip_on=True)
                     if len(sen)>0:
-                        axes[r,1].scatter(sen['wx'], sen['wy'], c='#87CEFA', s=70, alpha=0.9, marker='o', edgecolors='royalblue', linewidths=1.5)
+                        axes[r,1].scatter(sen['wx'], sen['wy'], c='#87CEFA', s=50, alpha=0.9, marker='o', edgecolors='royalblue', linewidths=1.5, clip_on=True)
             # Day Radiant (col 2)
             if not dfr.empty and not night:
                 dsub = dfr[dfr['time_window'] == win]
@@ -716,9 +967,9 @@ class CompleteMapOverlayGenerator:
                     obs = dsub[dsub['ward_type']=='observer']
                     sen = dsub[dsub['ward_type']=='sentry']
                     if len(obs)>0:
-                        axes[r,2].scatter(obs['wx'], obs['wy'], c='yellow', s=80, alpha=0.9, marker='o', edgecolors='goldenrod', linewidths=1.5)
+                        axes[r,2].scatter(obs['wx'], obs['wy'], c='yellow', s=80, alpha=0.9, marker='o', edgecolors='goldenrod', linewidths=1.5, clip_on=True)
                     if len(sen)>0:
-                        axes[r,2].scatter(sen['wx'], sen['wy'], c='#87CEFA', s=70, alpha=0.9, marker='o', edgecolors='royalblue', linewidths=1.5)
+                        axes[r,2].scatter(sen['wx'], sen['wy'], c='#87CEFA', s=50, alpha=0.9, marker='o', edgecolors='royalblue', linewidths=1.5, clip_on=True)
             # Day Dire (col 3)
             if not dfd.empty and not night:
                 dsub = dfd[dfd['time_window'] == win]
@@ -726,9 +977,9 @@ class CompleteMapOverlayGenerator:
                     obs = dsub[dsub['ward_type']=='observer']
                     sen = dsub[dsub['ward_type']=='sentry']
                     if len(obs)>0:
-                        axes[r,3].scatter(obs['wx'], obs['wy'], c='yellow', s=80, alpha=0.9, marker='o', edgecolors='goldenrod', linewidths=1.5)
+                        axes[r,3].scatter(obs['wx'], obs['wy'], c='yellow', s=80, alpha=0.9, marker='o', edgecolors='goldenrod', linewidths=1.5, clip_on=True)
                     if len(sen)>0:
-                        axes[r,3].scatter(sen['wx'], sen['wy'], c='#87CEFA', s=70, alpha=0.9, marker='o', edgecolors='royalblue', linewidths=1.5)
+                        axes[r,3].scatter(sen['wx'], sen['wy'], c='#87CEFA', s=50, alpha=0.9, marker='o', edgecolors='royalblue', linewidths=1.5, clip_on=True)
 
             # Row titles (on col 0) include window label and icon
             icon = '☾' if night else '☀'
@@ -785,7 +1036,7 @@ class CompleteMapOverlayGenerator:
             fig, ax = plt.subplots(figsize=(7, 6))
             ax.imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
             df_window = df_pos[df_pos['time_window'] == time_window]
-            df_window = self._df_with_world_coords(df_window)
+            df_window = self._df_with_world_coords(df_window, debug_match_id=match_id)
             self._draw_wards_with_optional_vision(ax, df_window)
             if self.show_labels:
                 # Annotate coordinates for each ward point in per-window report
@@ -795,6 +1046,8 @@ class CompleteMapOverlayGenerator:
                          bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
             ax.set_xlim(0, self.map_width)
             ax.set_ylim(0, self.map_height)
+            ax.set_aspect('equal', adjustable='box')
+            ax.margins(0)
             ax.grid(True, alpha=0.3, color='white')
             ax.set_facecolor('black')
             ax.legend(loc='upper right', fontsize=10, framealpha=0.8)
@@ -885,7 +1138,7 @@ class CompleteMapOverlayGenerator:
                 
                 if len(sen_wards) > 0:
                     axes[i].scatter(sen_wards['wx'], sen_wards['wy'], 
-                                  c=stage_color, s=120, alpha=0.9, marker='^', 
+                                  c=stage_color, s=80, alpha=0.9, marker='^', 
                                   edgecolors='darkred', linewidths=2, label='Sentry')
                 
                 if len(obs_wards) > 0 or len(sen_wards) > 0:
@@ -985,9 +1238,9 @@ class CompleteMapOverlayGenerator:
                 obs = df_cat[df_cat['ward_type'] == 'observer']
                 sen = df_cat[df_cat['ward_type'] == 'sentry']
                 if len(obs) > 0:
-                    ax.scatter(obs['wx'], obs['wy'], c=color_map[cat], s=120, alpha=0.9, marker='o', edgecolors='black', linewidths=2, label='Observer')
+                    ax.scatter(obs['wx'], obs['wy'], c=color_map[cat], s=120, alpha=0.9, marker='o', edgecolors='black', linewidths=2, label='Observer', clip_on=True)
                 if len(sen) > 0:
-                    ax.scatter(sen['wx'], sen['wy'], c=color_map[cat], s=120, alpha=0.9, marker='^', edgecolors='black', linewidths=2, label='Sentry')
+                    ax.scatter(sen['wx'], sen['wy'], c=color_map[cat], s=80, alpha=0.9, marker='^', edgecolors='black', linewidths=2, label='Sentry', clip_on=True)
                 if self.show_labels:
                     # Annotate coordinates for precise locations
                     self._annotate_coords(ax, df_cat, text_color='white', fontsize=7)
@@ -995,6 +1248,8 @@ class CompleteMapOverlayGenerator:
             ax.set_title(f'{cat}\n({len(df_cat)} wards)', fontsize=12, color='white', fontweight='bold', bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
             ax.set_xlim(0, self.map_width)
             ax.set_ylim(0, self.map_height)
+            ax.set_aspect('equal', adjustable='box')
+            ax.margins(0)
             ax.grid(True, alpha=0.3, color='white')
             ax.set_facecolor('black')
         plt.tight_layout()
@@ -1053,9 +1308,9 @@ class CompleteMapOverlayGenerator:
                 obs = df_cat[df_cat['ward_type'] == 'observer']
                 sen = df_cat[df_cat['ward_type'] == 'sentry']
                 if len(obs) > 0:
-                    ax.scatter(obs['wx'], obs['wy'], c=color_map[cat], s=120, alpha=0.9, marker='o', edgecolors='black', linewidths=2, label='Observer')
+                    ax.scatter(obs['wx'], obs['wy'], c=color_map[cat], s=120, alpha=0.9, marker='o', edgecolors='black', linewidths=2, label='Observer', clip_on=True)
                 if len(sen) > 0:
-                    ax.scatter(sen['wx'], sen['wy'], c=color_map[cat], s=120, alpha=0.9, marker='^', edgecolors='black', linewidths=2, label='Sentry')
+                    ax.scatter(sen['wx'], sen['wy'], c=color_map[cat], s=80, alpha=0.9, marker='^', edgecolors='black', linewidths=2, label='Sentry', clip_on=True)
                 if self.show_labels:
                     # Annotate coordinates for precise locations
                     self._annotate_coords(ax, df_cat, text_color='white', fontsize=7)
@@ -1063,6 +1318,8 @@ class CompleteMapOverlayGenerator:
             ax.set_title(f'{cat}\n({len(df_cat)} wards)', fontsize=12, color='white', fontweight='bold', bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
             ax.set_xlim(0, self.map_width)
             ax.set_ylim(0, self.map_height)
+            ax.set_aspect('equal', adjustable='box')
+            ax.margins(0)
             ax.grid(True, alpha=0.3, color='white')
             ax.set_facecolor('black')
         plt.tight_layout()
@@ -1188,9 +1445,9 @@ class CompleteMapOverlayGenerator:
                 sen_wards = df_time[df_time['ward_type'] == 'sentry']
                 
                 if len(obs_wards) > 0:
-                    ax.scatter(obs_wards['wx'], obs_wards['wy'], c='cyan', s=40, alpha=0.9, marker='o')
+                    ax.scatter(obs_wards['wx'], obs_wards['wy'], c='cyan', s=40, alpha=0.9, marker='o', clip_on=True)
                 if len(sen_wards) > 0:
-                    ax.scatter(sen_wards['wx'], sen_wards['wy'], c='yellow', s=40, alpha=0.9, marker='^')
+                    ax.scatter(sen_wards['wx'], sen_wards['wy'], c='yellow', s=40, alpha=0.9, marker='^', clip_on=True)
             
             ax.set_title(f'{time_window}\n({len(df_time)})', fontsize=10, color='white')
             ax.set_xlim(0, self.map_width)
@@ -1216,9 +1473,9 @@ class CompleteMapOverlayGenerator:
                 stage_color = stage_colors[i % len(stage_colors)]
                 
                 if len(obs_wards) > 0:
-                    ax.scatter(obs_wards['wx'], obs_wards['wy'], c=stage_color, s=40, alpha=0.9, marker='o')
+                    ax.scatter(obs_wards['wx'], obs_wards['wy'], c=stage_color, s=40, alpha=0.9, marker='o', clip_on=True)
                 if len(sen_wards) > 0:
-                    ax.scatter(sen_wards['wx'], sen_wards['wy'], c=stage_color, s=40, alpha=0.9, marker='^')
+                    ax.scatter(sen_wards['wx'], sen_wards['wy'], c=stage_color, s=40, alpha=0.9, marker='^', clip_on=True)
             
             ax.set_title(f'{stage}\n({len(df_stage)})', fontsize=10, color='white')
             ax.set_xlim(0, self.map_width)
@@ -1280,6 +1537,8 @@ class CompleteMapOverlayGenerator:
         ax_overview.set_title(f'All Wards Overview\n({len(df_pos)} total wards)', fontsize=14, color='white')
         ax_overview.set_xlim(0, self.map_width)
         ax_overview.set_ylim(0, self.map_height)
+        ax_overview.set_aspect('equal', adjustable='box')
+        ax_overview.margins(0)
         ax_overview.legend(fontsize=12, framealpha=0.8)
         
         # 5. Ward density heatmap (bottom right)
@@ -1309,6 +1568,8 @@ class CompleteMapOverlayGenerator:
         ax_density.set_title('Ward Density Heatmap', fontsize=14, color='white')
         ax_density.set_xlim(0, self.map_width)
         ax_density.set_ylim(0, self.map_height)
+        ax_density.set_aspect('equal', adjustable='box')
+        ax_density.margins(0)
         
         # Add section labels
         fig.text(0.02, 0.79, 'TIME\nPROGRESSION', rotation=90, fontsize=16, fontweight='bold', 
