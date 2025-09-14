@@ -174,20 +174,22 @@ class CompleteMapOverlayGenerator:
     # ------------------------------
     def _df_with_world_coords(self, df):
         """Return a copy of df with plotting coords (wx, wy) derived from OpenDota x/y.
-        We map the 0..255 grid to image pixel coordinates (0..width, 0..height),
-        flipping Y so that (0,0) is bottom-left for plotting with origin='lower'.
+        OpenDota uses a 128x128 grid (x,y in [0,127]) with origin at top-left.
+        We map directly to image pixel coordinates (origin='upper').
         """
         if df is None or len(df) == 0:
             return df
-        # Avoid division by zero
-        denom = 255.0
+        # OpenDota grid is 0..127
+        denom = 127.0
         dfx = df.copy()
         dfx = dfx.dropna(subset=['x', 'y'])
         if len(dfx) == 0:
             return dfx
-        dfx['wx'] = (dfx['x'].astype(float) / denom) * float(self.map_width)
-        # For origin='upper', y increases downward in image space
-        dfx['wy'] = (dfx['y'].astype(float) / denom) * float(self.map_height)
+        xg = dfx['x'].astype(float).clip(lower=0.0, upper=denom)
+        yg = dfx['y'].astype(float).clip(lower=0.0, upper=denom)
+        # Optional: align to cell centers using +0.5 offset. Keep 0.0 for now to match edges.
+        dfx['wx'] = (xg / denom) * float(self.map_width)
+        dfx['wy'] = (yg / denom) * float(self.map_height)
         return dfx
     
     def _create_synthetic_map(self):
@@ -737,10 +739,7 @@ class CompleteMapOverlayGenerator:
 
         for time_window in tqdm(time_windows, desc=f"{team_name} {match_id} per 5-min reports"):
             fig, ax = plt.subplots(figsize=(7, 6))
-            ax.imshow(self.map_image, extent=[
-                self.map_bounds['left'], self.map_bounds['right'],
-                self.map_bounds['bottom'], self.map_bounds['top']
-            ])
+            ax.imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
             df_window = df_pos[df_pos['time_window'] == time_window]
             df_window = self._df_with_world_coords(df_window)
             self._draw_wards_with_optional_vision(ax, df_window)
@@ -750,8 +749,8 @@ class CompleteMapOverlayGenerator:
             ax.set_title(f'{team_name} - Match {match_id}  {time_window}\n({len(df_window)} wards)',
                          fontsize=12, color='white', fontweight='bold',
                          bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
-            ax.set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-            ax.set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+            ax.set_xlim(0, self.map_width)
+            ax.set_ylim(0, self.map_height)
             ax.grid(True, alpha=0.3, color='white')
             ax.set_facecolor('black')
             ax.legend(loc='upper right', fontsize=10, framealpha=0.8)
@@ -824,10 +823,7 @@ class CompleteMapOverlayGenerator:
                 break
             
             # Show map background
-            axes[i].imshow(self.map_image, extent=[
-                self.map_bounds['left'], self.map_bounds['right'],
-                self.map_bounds['bottom'], self.map_bounds['top']
-            ])
+            axes[i].imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
             
             df_stage = df_pos[df_pos['game_stage'] == stage]
             df_stage = self._df_with_world_coords(df_stage)
@@ -839,12 +835,12 @@ class CompleteMapOverlayGenerator:
                 stage_color = stage_colors.get(stage, 'white')
                 
                 if len(obs_wards) > 0:
-                    axes[i].scatter(obs_wards['x'], obs_wards['y'], 
+                    axes[i].scatter(obs_wards['wx'], obs_wards['wy'], 
                                   c=stage_color, s=120, alpha=0.9, marker='o', 
                                   edgecolors='darkblue', linewidths=2, label='Observer')
                 
                 if len(sen_wards) > 0:
-                    axes[i].scatter(sen_wards['x'], sen_wards['y'], 
+                    axes[i].scatter(sen_wards['wx'], sen_wards['wy'], 
                                   c=stage_color, s=120, alpha=0.9, marker='^', 
                                   edgecolors='darkred', linewidths=2, label='Sentry')
                 
@@ -857,8 +853,8 @@ class CompleteMapOverlayGenerator:
             axes[i].set_title(f'{stage}\n({len(df_stage)} wards)', 
                             fontsize=12, color='white', fontweight='bold',
                             bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
-            axes[i].set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-            axes[i].set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+            axes[i].set_xlim(0, self.map_width)
+            axes[i].set_ylim(0, self.map_height)
             axes[i].grid(True, alpha=0.3, color='white')
             axes[i].set_facecolor('black')
         
@@ -937,7 +933,7 @@ class CompleteMapOverlayGenerator:
         color_map = {'Offensive': 'red', 'Defensive': 'blue', 'Neutral': 'green'}
         for i, cat in enumerate(categories):
             ax = axes[i]
-            ax.imshow(self.map_image, extent=[self.map_bounds['left'], self.map_bounds['right'], self.map_bounds['bottom'], self.map_bounds['top']])
+            ax.imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
             df_cat = df_pos[df_pos['context'] == cat]
             df_cat = self._df_with_world_coords(df_cat)
             if not df_cat.empty:
@@ -953,8 +949,8 @@ class CompleteMapOverlayGenerator:
                     self._annotate_coords(ax, df_cat, text_color='white', fontsize=7)
                 ax.legend(loc='upper right', fontsize=10, framealpha=0.8)
             ax.set_title(f'{cat}\n({len(df_cat)} wards)', fontsize=12, color='white', fontweight='bold', bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
-            ax.set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-            ax.set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+            ax.set_xlim(0, self.map_width)
+            ax.set_ylim(0, self.map_height)
             ax.grid(True, alpha=0.3, color='white')
             ax.set_facecolor('black')
         plt.tight_layout()
@@ -1006,7 +1002,7 @@ class CompleteMapOverlayGenerator:
         color_map = {'Advantage': 'lime', 'Even': 'orange', 'Disadvantage': 'red'}
         for i, cat in enumerate(categories):
             ax = axes[i]
-            ax.imshow(self.map_image, extent=[self.map_bounds['left'], self.map_bounds['right'], self.map_bounds['bottom'], self.map_bounds['top']])
+            ax.imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
             df_cat = df_pos[df_pos['adv_state'] == cat]
             df_cat = self._df_with_world_coords(df_cat)
             if not df_cat.empty:
@@ -1021,8 +1017,8 @@ class CompleteMapOverlayGenerator:
                     self._annotate_coords(ax, df_cat, text_color='white', fontsize=7)
                 ax.legend(loc='upper right', fontsize=10, framealpha=0.8)
             ax.set_title(f'{cat}\n({len(df_cat)} wards)', fontsize=12, color='white', fontweight='bold', bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
-            ax.set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-            ax.set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+            ax.set_xlim(0, self.map_width)
+            ax.set_ylim(0, self.map_height)
             ax.grid(True, alpha=0.3, color='white')
             ax.set_facecolor('black')
         plt.tight_layout()
@@ -1082,12 +1078,12 @@ class CompleteMapOverlayGenerator:
                 momentum_color = momentum_colors[momentum]
                 
                 if len(obs_wards) > 0:
-                    axes[i].scatter(obs_wards['x'], obs_wards['y'], 
+                    axes[i].scatter(obs_wards['wx'], obs_wards['wy'], 
                                   c=momentum_color, s=140, alpha=0.9, marker='o', 
                                   edgecolors='black', linewidths=3, label='Observer')
                 
                 if len(sen_wards) > 0:
-                    axes[i].scatter(sen_wards['x'], sen_wards['y'], 
+                    axes[i].scatter(sen_wards['wx'], sen_wards['wy'], 
                                   c=momentum_color, s=140, alpha=0.9, marker='^', 
                                   edgecolors='black', linewidths=3, label='Sentry')
                 
@@ -1100,8 +1096,8 @@ class CompleteMapOverlayGenerator:
             axes[i].set_title(f'{momentum} Momentum\n({len(df_momentum)} wards)', 
                             fontsize=14, color='white', fontweight='bold',
                             bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.8))
-            axes[i].set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-            axes[i].set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+            axes[i].set_xlim(0, self.map_width)
+            axes[i].set_ylim(0, self.map_height)
             axes[i].grid(True, alpha=0.3, color='white')
             axes[i].set_facecolor('black')
         
@@ -1138,10 +1134,7 @@ class CompleteMapOverlayGenerator:
         
         for i, time_window in enumerate(time_windows):
             ax = fig.add_subplot(gs_time[0, i])
-            ax.imshow(self.map_image, extent=[
-                self.map_bounds['left'], self.map_bounds['right'],
-                self.map_bounds['bottom'], self.map_bounds['top']
-            ])
+            ax.imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
             
             df_time = df_pos[df_pos['time_window'] == time_window]
             df_time = self._df_with_world_coords(df_time)
@@ -1156,8 +1149,8 @@ class CompleteMapOverlayGenerator:
                     ax.scatter(sen_wards['wx'], sen_wards['wy'], c='yellow', s=40, alpha=0.9, marker='^')
             
             ax.set_title(f'{time_window}\n({len(df_time)})', fontsize=10, color='white')
-            ax.set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-            ax.set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+            ax.set_xlim(0, self.map_width)
+            ax.set_ylim(0, self.map_height)
             ax.set_xticks([])
             ax.set_yticks([])
         
@@ -1167,10 +1160,7 @@ class CompleteMapOverlayGenerator:
         
         for i, stage in enumerate(game_stages):
             ax = fig.add_subplot(gs_time[1, i])
-            ax.imshow(self.map_image, extent=[
-                self.map_bounds['left'], self.map_bounds['right'],
-                self.map_bounds['bottom'], self.map_bounds['top']
-            ])
+            ax.imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
             
             df_stage = df_pos[df_pos['game_stage'] == stage]
             df_stage = self._df_with_world_coords(df_stage)
@@ -1187,8 +1177,8 @@ class CompleteMapOverlayGenerator:
                     ax.scatter(sen_wards['wx'], sen_wards['wy'], c=stage_color, s=40, alpha=0.9, marker='^')
             
             ax.set_title(f'{stage}\n({len(df_stage)})', fontsize=10, color='white')
-            ax.set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-            ax.set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+            ax.set_xlim(0, self.map_width)
+            ax.set_ylim(0, self.map_height)
             ax.set_xticks([])
             ax.set_yticks([])
         
@@ -1198,10 +1188,7 @@ class CompleteMapOverlayGenerator:
         
         for i, momentum in enumerate(momentums):
             ax = fig.add_subplot(gs_time[2, i*2:(i+1)*2])
-            ax.imshow(self.map_image, extent=[
-                self.map_bounds['left'], self.map_bounds['right'],
-                self.map_bounds['bottom'], self.map_bounds['top']
-            ])
+            ax.imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
             
             df_momentum = df_pos[df_pos['momentum'] == momentum]
             df_momentum = self._df_with_world_coords(df_momentum)
@@ -1222,8 +1209,8 @@ class CompleteMapOverlayGenerator:
                              edgecolors='black', linewidths=2, label='Sentry')
             
             ax.set_title(f'{momentum} Momentum\n({len(df_momentum)} wards)', fontsize=12, color='white')
-            ax.set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-            ax.set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+            ax.set_xlim(0, self.map_width)
+            ax.set_ylim(0, self.map_height)
             ax.set_xticks([])
             ax.set_yticks([])
             if len(df_momentum) > 0:
@@ -1231,10 +1218,7 @@ class CompleteMapOverlayGenerator:
         
         # 4. Combined overview (bottom row)
         ax_overview = fig.add_subplot(gs_time[3, :4])
-        ax_overview.imshow(self.map_image, extent=[
-            self.map_bounds['left'], self.map_bounds['right'],
-            self.map_bounds['bottom'], self.map_bounds['top']
-        ])
+        ax_overview.imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
         
         dfo = self._df_with_world_coords(df_pos)
         obs_wards = dfo[dfo['ward_type'] == 'observer']
@@ -1250,16 +1234,13 @@ class CompleteMapOverlayGenerator:
                               edgecolors='red', linewidths=2, label='Sentry')
         
         ax_overview.set_title(f'All Wards Overview\n({len(df_pos)} total wards)', fontsize=14, color='white')
-        ax_overview.set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-        ax_overview.set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+        ax_overview.set_xlim(0, self.map_width)
+        ax_overview.set_ylim(0, self.map_height)
         ax_overview.legend(fontsize=12, framealpha=0.8)
         
         # 5. Ward density heatmap (bottom right)
         ax_density = fig.add_subplot(gs_time[3, 4:])
-        ax_density.imshow(self.map_image, extent=[
-            self.map_bounds['left'], self.map_bounds['right'],
-            self.map_bounds['bottom'], self.map_bounds['top']
-        ])
+        ax_density.imshow(self.map_image, origin='upper', extent=[0, self.map_width, 0, self.map_height])
         
         if len(df_pos) > 10:
             try:
@@ -1268,23 +1249,22 @@ class CompleteMapOverlayGenerator:
                 heatmap, xedges, yedges = np.histogram2d(
                     dfo['wx'], dfo['wy'], 
                     bins=40, 
-                    range=[[self.map_bounds['left'], self.map_bounds['right']], 
-                           [self.map_bounds['bottom'], self.map_bounds['top']]]
+                    range=[[0, float(self.map_width)],[0, float(self.map_height)]]
                 )
                 heatmap_smooth = ndimage.gaussian_filter(heatmap, sigma=1.5)
                 im = ax_density.imshow(heatmap_smooth.T, 
-                                     extent=[self.map_bounds['left'], self.map_bounds['right'],
-                                           self.map_bounds['bottom'], self.map_bounds['top']], 
-                                     alpha=0.7, cmap='hot', origin='lower')
+                                     extent=[0, self.map_width, 0, self.map_height], 
+                                     alpha=0.7, cmap='hot', origin='upper')
                 plt.colorbar(im, ax=ax_density, shrink=0.8)
             except ImportError:
                 # Fallback if scipy not available
-                ax_density.scatter(df_pos['x'], df_pos['y'], c=df_pos['time'], 
+                dfo = self._df_with_world_coords(df_pos)
+                ax_density.scatter(dfo['wx'], dfo['wy'], c=dfo['time'], 
                                  s=60, alpha=0.8, cmap='viridis')
         
         ax_density.set_title('Ward Density Heatmap', fontsize=14, color='white')
-        ax_density.set_xlim(self.map_bounds['left'], self.map_bounds['right'])
-        ax_density.set_ylim(self.map_bounds['bottom'], self.map_bounds['top'])
+        ax_density.set_xlim(0, self.map_width)
+        ax_density.set_ylim(0, self.map_height)
         
         # Add section labels
         fig.text(0.02, 0.79, 'TIME\nPROGRESSION', rotation=90, fontsize=16, fontweight='bold', 
